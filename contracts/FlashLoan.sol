@@ -84,6 +84,8 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
 
     address public owner;
 
+    mapping(address => bool) public whitelist;
+
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------
@@ -95,12 +97,19 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         uint256 profit
     );
 
+    event WhitelistUpdated(address indexed account, bool allowed);
+
     // -----------------------------------------------------------------------
     // Modifiers
     // -----------------------------------------------------------------------
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    modifier onlyWhitelisted() {
+        require(whitelist[msg.sender], "Not whitelisted");
         _;
     }
 
@@ -116,6 +125,7 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         ADDRESSES_PROVIDER = IPoolAddressesProvider(addressesProvider);
         POOL = IPool(IPoolAddressesProvider(addressesProvider).getPool());
         owner = msg.sender;
+        whitelist[msg.sender] = true;
     }
 
     // -----------------------------------------------------------------------
@@ -132,8 +142,25 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         address asset,
         uint256 amount,
         bytes calldata params
-    ) external onlyOwner {
+    ) external onlyWhitelisted {
         POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Owner — whitelist management
+    // -----------------------------------------------------------------------
+
+    /// @notice Add an address to the caller whitelist.
+    function addToWhitelist(address account) external onlyOwner {
+        require(account != address(0), "Zero address");
+        whitelist[account] = true;
+        emit WhitelistUpdated(account, true);
+    }
+
+    /// @notice Remove an address from the caller whitelist.
+    function removeFromWhitelist(address account) external onlyOwner {
+        whitelist[account] = false;
+        emit WhitelistUpdated(account, false);
     }
 
     // -----------------------------------------------------------------------
