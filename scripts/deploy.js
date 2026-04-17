@@ -1,4 +1,6 @@
 const hre = require("hardhat");
+const fs = require("fs");
+const path = require("path");
 
 // Aave V3 PoolAddressesProvider addresses
 const ADDRESSES_PROVIDER = {
@@ -26,6 +28,16 @@ async function main() {
 
   const address = await contract.getAddress();
   console.log(`FlashLoan deployed to: ${address}`);
+
+  // Write deployment info for Makefile / CI to pick up
+  const deployedPath = path.join(__dirname, "..", "deployed.json");
+  fs.writeFileSync(
+    deployedPath,
+    JSON.stringify({ address, network, deployer: deployer.address, timestamp: new Date().toISOString() }, null, 2)
+  );
+  console.log(`Deployment info saved to not-bot/deployed.json`);
+  // Machine-readable marker for grep in Makefile
+  console.log(`DEPLOYED_ADDRESS=${address}`);
 }
 
 main().catch((err) => {
