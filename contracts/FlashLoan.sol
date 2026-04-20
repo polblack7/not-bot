@@ -6,6 +6,12 @@ import {IPool} from "@aave/core-v3/contracts/interfaces/IPool.sol";
 import {IPoolAddressesProvider} from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
 import {IFlashLoanSimpleReceiver} from "@aave/core-v3/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol";
 
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20 as IERC20OZ} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 // ---------------------------------------------------------------------------
 // DEX router interfaces
 // ---------------------------------------------------------------------------
@@ -73,18 +79,18 @@ interface IUniswapV3Router {
  *      uint256 minProfit      // minimum profit required, in asset units
  *  )
  */
-contract FlashLoan is IFlashLoanSimpleReceiver {
+contract FlashLoan is IFlashLoanSimpleReceiver, Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20OZ;
+
     /// @notice DEX type: Uniswap V2 / SushiSwap / ShibaSwap
     uint8 public constant DEX_V2 = 0;
     /// @notice DEX type: Uniswap V3
     uint8 public constant DEX_V3 = 1;
 
     IPoolAddressesProvider public immutable override ADDRESSES_PROVIDER;
-    IPool                  public immutable override POOL;
-
-    address public owner;
 
     mapping(address => bool) public whitelist;
+    mapping(address => bool) public approvedRouters;
 
     // -----------------------------------------------------------------------
     // Events
@@ -98,15 +104,13 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
     );
 
     event WhitelistUpdated(address indexed account, bool allowed);
+    event RouterApprovalUpdated(address indexed router, bool approved);
+    event Withdrawn(address indexed token, address indexed to, uint256 amount);
+    event WithdrawnETH(address indexed to, uint256 amount);
 
     // -----------------------------------------------------------------------
     // Modifiers
     // -----------------------------------------------------------------------
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
-    }
 
     modifier onlyWhitelisted() {
         require(whitelist[msg.sender], "Not whitelisted");
@@ -119,13 +123,23 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
 
     /**
      * @param addressesProvider Aave V3 PoolAddressesProvider.
-     *        Ethereum mainnet: 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9
+     *        Ethereum mainnet: 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e
      */
-    constructor(address addressesProvider) {
+    constructor(address addressesProvider) Ownable(msg.sender) {
+        require(addressesProvider != address(0), "Zero provider");
         ADDRESSES_PROVIDER = IPoolAddressesProvider(addressesProvider);
-        POOL = IPool(IPoolAddressesProvider(addressesProvider).getPool());
-        owner = msg.sender;
         whitelist[msg.sender] = true;
+        emit WhitelistUpdated(msg.sender, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // View
+    // -----------------------------------------------------------------------
+
+    /// @notice Current Aave pool. Resolved dynamically to honor upgrades
+    ///         performed via PoolAddressesProvider.
+    function POOL() public view override returns (IPool) {
+        return IPool(ADDRESSES_PROVIDER.getPool());
     }
 
     // -----------------------------------------------------------------------
@@ -138,12 +152,22 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
      * @param amount Amount to borrow.
      * @param params ABI-encoded arb route (see struct description above).
      */
+    /// @notice Pause all arbitrage execution. Used when migrating to a new contract.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume arbitrage execution.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     function requestFlashLoan(
         address asset,
         uint256 amount,
         bytes calldata params
-    ) external onlyWhitelisted {
-        POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+    ) external onlyWhitelisted nonReentrant whenNotPaused {
+        POOL().flashLoanSimple(address(this), asset, amount, params, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -163,6 +187,15 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         emit WhitelistUpdated(account, false);
     }
 
+    /// @notice Approve a DEX router address. Only approved routers can be
+    ///         used in arbitrage params — guards against a compromised
+    ///         whitelisted key routing through a malicious contract.
+    function setRouterApproval(address router, bool approved) external onlyOwner {
+        require(router != address(0), "Zero address");
+        approvedRouters[router] = approved;
+        emit RouterApprovalUpdated(router, approved);
+    }
+
     // -----------------------------------------------------------------------
     // IFlashLoanSimpleReceiver — callback
     // -----------------------------------------------------------------------
@@ -178,7 +211,8 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         address initiator,
         bytes calldata params
     ) external override returns (bool) {
-        require(msg.sender == address(POOL), "Caller must be POOL");
+        IPool pool = POOL();
+        require(msg.sender == address(pool), "Caller must be POOL");
         require(initiator == address(this), "Only this contract can initiate");
 
         (
@@ -195,6 +229,9 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
             (address, uint8, address, uint24, uint8, address, uint24, uint256)
         );
 
+        require(approvedRouters[buyRouter],  "Buy router not approved");
+        require(approvedRouters[sellRouter], "Sell router not approved");
+
         // Leg 1 — buy tokenOut cheaply by spending asset
         uint256 amountOut = _swap(buyDexType, buyRouter, asset, tokenOut, amount, buyFee);
 
@@ -208,7 +245,7 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         emit ArbitrageExecuted(asset, tokenOut, amount, amountBack - totalOwed);
 
         // Approve Aave to pull back principal + premium; profit stays here
-        IERC20(asset).approve(address(POOL), totalOwed);
+        IERC20OZ(asset).forceApprove(address(pool), totalOwed);
         return true;
     }
 
@@ -217,17 +254,20 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
     // -----------------------------------------------------------------------
 
     /// @notice Withdraw all of `token` held by this contract to the owner.
-    function withdraw(address token) external onlyOwner {
-        uint256 balance = IERC20(token).balanceOf(address(this));
+    function withdraw(address token) external onlyOwner nonReentrant {
+        uint256 balance = IERC20OZ(token).balanceOf(address(this));
         require(balance > 0, "No balance");
-        IERC20(token).transfer(owner, balance);
+        IERC20OZ(token).safeTransfer(owner(), balance);
+        emit Withdrawn(token, owner(), balance);
     }
 
     /// @notice Withdraw all ETH held by this contract to the owner.
-    function withdrawETH() external onlyOwner {
+    function withdrawETH() external onlyOwner nonReentrant {
         uint256 balance = address(this).balance;
         require(balance > 0, "No ETH balance");
-        payable(owner).transfer(balance);
+        (bool ok, ) = payable(owner()).call{value: balance}("");
+        require(ok, "ETH transfer failed");
+        emit WithdrawnETH(owner(), balance);
     }
 
     receive() external payable {}
@@ -238,8 +278,8 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
 
     /**
      * @dev Routes a single swap through either a V2-compatible or V3 router.
-     *      Sets `amountOutMin = 1`; the profitability check in executeOperation
-     *      is the real slippage guard.
+     *      Uses the caller-supplied `minProfit` check in executeOperation as
+     *      the real slippage guard, so per-hop amountOutMin is set to 1.
      *
      * @param dexType  DEX_V2 or DEX_V3.
      * @param router   Router contract address.
@@ -257,7 +297,7 @@ contract FlashLoan is IFlashLoanSimpleReceiver {
         uint256 amountIn,
         uint24  fee
     ) internal returns (uint256 amountOut) {
-        IERC20(tokenIn).approve(router, amountIn);
+        IERC20OZ(tokenIn).forceApprove(router, amountIn);
 
         if (dexType == DEX_V2) {
             address[] memory path = new address[](2);

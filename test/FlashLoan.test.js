@@ -81,6 +81,11 @@ async function deployFixture() {
   const FlashLoan = await ethers.getContractFactory("FlashLoan");
   const flashLoan  = await FlashLoan.deploy(await provider.getAddress());
 
+  // Approve all mock routers so existing arb paths work out of the box.
+  await flashLoan.setRouterApproval(await buyRouterV2.getAddress(),  true);
+  await flashLoan.setRouterApproval(await sellRouterV2.getAddress(), true);
+  await flashLoan.setRouterApproval(await sellRouterV3.getAddress(), true);
+
   return {
     owner,
     attacker,
@@ -181,7 +186,9 @@ describe("FlashLoan — arbitrage", function () {
       const { flashLoan, attacker, alice } = await loadFixture(deployFixture);
       await expect(
         flashLoan.connect(attacker).addToWhitelist(alice.address)
-      ).to.be.revertedWith("Not owner");
+      )
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
     });
 
     it("reverts addToWhitelist for zero address", async function () {
@@ -195,7 +202,9 @@ describe("FlashLoan — arbitrage", function () {
       const { flashLoan, attacker, owner } = await loadFixture(deployFixture);
       await expect(
         flashLoan.connect(attacker).removeFromWhitelist(owner.address)
-      ).to.be.revertedWith("Not owner");
+      )
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
     });
 
     it("removes an address from the whitelist", async function () {
@@ -304,6 +313,7 @@ describe("FlashLoan — arbitrage", function () {
       const BadSell = await ethers.getContractFactory("MockV2Router");
       const badSellRouter = await BadSell.deploy(45, 100);
       await tokenA.mint(await badSellRouter.getAddress(), ethers.parseEther("10000"));
+      await flashLoan.setRouterApproval(await badSellRouter.getAddress(), true);
 
       const BORROW = ethers.parseEther("1");
       const params = encodeParams(
@@ -376,7 +386,150 @@ describe("FlashLoan — arbitrage", function () {
       const { flashLoan, attacker, tokenA } = await loadFixture(deployFixture);
       await expect(
         flashLoan.connect(attacker).withdraw(await tokenA.getAddress())
-      ).to.be.revertedWith("Not owner");
+      )
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
+    });
+  });
+
+  // ── router whitelist ───────────────────────────────────────────────────────
+
+  describe("Router whitelist", function () {
+    it("reverts executeOperation when buyRouter is not approved", async function () {
+      const { flashLoan, tokenA, tokenB, buyRouterV2, sellRouterV2 } =
+        await loadFixture(deployFixture);
+
+      await flashLoan.setRouterApproval(await buyRouterV2.getAddress(), false);
+
+      const params = encodeParams(
+        await tokenB.getAddress(),
+        DEX_V2, await buyRouterV2.getAddress(),  0,
+        DEX_V2, await sellRouterV2.getAddress(), 0,
+        0n
+      );
+
+      await expect(
+        flashLoan.requestFlashLoan(
+          await tokenA.getAddress(), ethers.parseEther("1"), params
+        )
+      ).to.be.revertedWith("Buy router not approved");
+    });
+
+    it("reverts setRouterApproval for non-owner", async function () {
+      const { flashLoan, attacker, buyRouterV2 } = await loadFixture(deployFixture);
+      await expect(
+        flashLoan.connect(attacker).setRouterApproval(await buyRouterV2.getAddress(), true)
+      )
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
+    });
+
+    it("emits RouterApprovalUpdated", async function () {
+      const { flashLoan, buyRouterV2 } = await loadFixture(deployFixture);
+      await expect(flashLoan.setRouterApproval(await buyRouterV2.getAddress(), false))
+        .to.emit(flashLoan, "RouterApprovalUpdated")
+        .withArgs(await buyRouterV2.getAddress(), false);
+    });
+  });
+
+  // ── ownership transfer (Ownable2Step) ──────────────────────────────────────
+
+  describe("Ownership (2-step)", function () {
+    it("transfer is 2-step: pending then accepted", async function () {
+      const { flashLoan, owner, alice } = await loadFixture(deployFixture);
+
+      await flashLoan.transferOwnership(alice.address);
+      // Owner hasn't changed yet
+      expect(await flashLoan.owner()).to.equal(owner.address);
+      expect(await flashLoan.pendingOwner()).to.equal(alice.address);
+
+      await flashLoan.connect(alice).acceptOwnership();
+      expect(await flashLoan.owner()).to.equal(alice.address);
+    });
+
+    it("only pending owner can accept", async function () {
+      const { flashLoan, attacker, alice } = await loadFixture(deployFixture);
+      await flashLoan.transferOwnership(alice.address);
+      await expect(flashLoan.connect(attacker).acceptOwnership())
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
+    });
+  });
+
+  // ── ETH withdrawal ─────────────────────────────────────────────────────────
+
+  describe("ETH withdrawal", function () {
+    it("owner can withdraw ETH sent to the contract", async function () {
+      const { flashLoan, owner, alice } = await loadFixture(deployFixture);
+      const AMOUNT = ethers.parseEther("0.5");
+
+      await alice.sendTransaction({ to: await flashLoan.getAddress(), value: AMOUNT });
+      expect(await ethers.provider.getBalance(await flashLoan.getAddress())).to.equal(AMOUNT);
+
+      await expect(flashLoan.withdrawETH())
+        .to.changeEtherBalances([flashLoan, owner], [-AMOUNT, AMOUNT]);
+    });
+
+    it("reverts withdrawETH when balance is zero", async function () {
+      const { flashLoan } = await loadFixture(deployFixture);
+      await expect(flashLoan.withdrawETH()).to.be.revertedWith("No ETH balance");
+    });
+  });
+
+  // ── pause ──────────────────────────────────────────────────────────────────
+
+  describe("Pause", function () {
+    it("owner can pause and unpause", async function () {
+      const { flashLoan } = await loadFixture(deployFixture);
+      expect(await flashLoan.paused()).to.be.false;
+      await flashLoan.pause();
+      expect(await flashLoan.paused()).to.be.true;
+      await flashLoan.unpause();
+      expect(await flashLoan.paused()).to.be.false;
+    });
+
+    it("reverts requestFlashLoan when paused", async function () {
+      const { flashLoan, tokenA, tokenB, buyRouterV2, sellRouterV2 } =
+        await loadFixture(deployFixture);
+
+      await flashLoan.pause();
+
+      const params = encodeParams(
+        await tokenB.getAddress(),
+        DEX_V2, await buyRouterV2.getAddress(), 0,
+        DEX_V2, await sellRouterV2.getAddress(), 0,
+        0n
+      );
+
+      await expect(
+        flashLoan.requestFlashLoan(await tokenA.getAddress(), ethers.parseEther("1"), params)
+      ).to.be.revertedWithCustomError(flashLoan, "EnforcedPause");
+    });
+
+    it("reverts pause when called by non-owner", async function () {
+      const { flashLoan, attacker } = await loadFixture(deployFixture);
+      await expect(flashLoan.connect(attacker).pause())
+        .to.be.revertedWithCustomError(flashLoan, "OwnableUnauthorizedAccount")
+        .withArgs(attacker.address);
+    });
+
+    it("arb executes normally after unpause", async function () {
+      const { flashLoan, tokenA, tokenB, buyRouterV2, sellRouterV2 } =
+        await loadFixture(deployFixture);
+
+      await flashLoan.pause();
+      await flashLoan.unpause();
+
+      const params = encodeParams(
+        await tokenB.getAddress(),
+        DEX_V2, await buyRouterV2.getAddress(), 0,
+        DEX_V2, await sellRouterV2.getAddress(), 0,
+        0n
+      );
+
+      await expect(
+        flashLoan.requestFlashLoan(await tokenA.getAddress(), ethers.parseEther("1"), params)
+      ).to.emit(flashLoan, "ArbitrageExecuted");
     });
   });
 
